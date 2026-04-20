@@ -277,87 +277,40 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     R: tokio::io::AsyncRead + Unpin,
 {
-    // Send all client bytes (handshake + ops)
-    writer.write_all(client_bytes).await?;
-    writer.flush().await?;
+    // Write and read must run concurrently: if write_all blocks on a full
+    // send buffer, the daemon can't drain it until we read its responses.
+    let write_fut = async {
+        writer.write_all(client_bytes).await?;
+        writer.flush().await?;
+        anyhow::Ok(())
+    };
 
-    let mut daemon = AsyncWireReader::new(BufReader::new(reader));
+    let read_fut = async {
+        let mut daemon = AsyncWireReader::new(BufReader::new(reader));
 
-    // Parse daemon handshake
-    let live_info = protocol::parse_daemon_handshake(&mut daemon, version).await?;
-    let live_version = std::cmp::min(version, live_info.server_version);
+        let live_info = protocol::parse_daemon_handshake(&mut daemon, version).await?;
+        let live_version = std::cmp::min(version, live_info.server_version);
 
-    eprintln!(
-        "connected: daemon {} (protocol {})",
-        live_info.daemon_nix_version.as_deref().unwrap_or("unknown"),
-        live_version,
-    );
+        eprintln!(
+            "connected: daemon {} (protocol {})",
+            live_info.daemon_nix_version.as_deref().unwrap_or("unknown"),
+            live_version,
+        );
 
-    let mut total = 0u64;
-    let mut passed = 0u64;
-    let mut failed = 0u64;
+        let mut total = 0u64;
+        let mut passed = 0u64;
+        let mut failed = 0u64;
 
-    // Evaluate handshake expects
-    if !preamble_expects.is_empty() {
-        let results = evaluate_handshake_expects(preamble_expects, &live_info);
-        for r in &results {
-            total += 1;
-            if r.passed {
-                passed += 1;
-                eprintln!("  handshake PASS: {}", r.message);
-            } else {
-                failed += 1;
-                eprintln!("  handshake FAIL: {}", r.message);
-                if fail_fast {
-                    eprintln!("stopping (--fail-fast)");
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
-
-    for (i, entry) in entries.iter().enumerate() {
-        let op = entry.op_call.op();
-        let op_name = op.name();
-
-        // Read daemon response
-        let (stderr_result, error_info) = protocol::read_stderr_with_error(&mut daemon).await?;
-
-        let result = if stderr_result.terminal == Some(StderrCode::Last) {
-            match protocol::read_daemon_result(op, live_version, &mut daemon).await {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    eprintln!("  op {i}: {op_name}: failed to parse result: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let terminal = terminal_name(stderr_result.terminal);
-
-        let response = DaemonResponse {
-            terminal: terminal.clone(),
-            stderr_count: stderr_result.count,
-            result,
-            error: error_info,
-        };
-
-        if entry.expects.is_empty() {
-            // Passthrough mode
-            eprintln!("  op {i}: {op_name} -> {terminal}");
-        } else {
-            // Evaluate expects
-            let results = evaluate_expects(&entry.expects, &response);
+        if !preamble_expects.is_empty() {
+            let results = evaluate_handshake_expects(preamble_expects, &live_info);
             for r in &results {
                 total += 1;
                 if r.passed {
                     passed += 1;
-                    eprintln!("  op {i}: {op_name} PASS: {}", r.message);
+                    eprintln!("  handshake PASS: {}", r.message);
                 } else {
                     failed += 1;
-                    eprintln!("  op {i}: {op_name} FAIL: {}", r.message);
+                    eprintln!("  handshake FAIL: {}", r.message);
                     if fail_fast {
                         eprintln!("stopping (--fail-fast)");
                         std::process::exit(1);
@@ -365,17 +318,68 @@ where
                 }
             }
         }
-    }
 
-    if total > 0 {
-        eprintln!("\n{passed}/{total} expects passed, {failed} failed");
-        if failed > 0 {
-            std::process::exit(1);
+        for (i, entry) in entries.iter().enumerate() {
+            let op = entry.op_call.op();
+            let op_name = op.name();
+
+            let (stderr_result, error_info) = protocol::read_stderr_with_error(&mut daemon).await?;
+
+            let result = if stderr_result.terminal == Some(StderrCode::Last) {
+                match protocol::read_daemon_result(op, live_version, &mut daemon).await {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        eprintln!("  op {i}: {op_name}: failed to parse result: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let terminal = terminal_name(stderr_result.terminal);
+
+            let response = DaemonResponse {
+                terminal: terminal.clone(),
+                stderr_count: stderr_result.count,
+                result,
+                error: error_info,
+            };
+
+            if entry.expects.is_empty() {
+                eprintln!("  op {i}: {op_name} -> {terminal}");
+            } else {
+                let results = evaluate_expects(&entry.expects, &response);
+                for r in &results {
+                    total += 1;
+                    if r.passed {
+                        passed += 1;
+                        eprintln!("  op {i}: {op_name} PASS: {}", r.message);
+                    } else {
+                        failed += 1;
+                        eprintln!("  op {i}: {op_name} FAIL: {}", r.message);
+                        if fail_fast {
+                            eprintln!("stopping (--fail-fast)");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
         }
-    } else {
-        eprintln!("\n{} ops executed (no expects)", entries.len());
-    }
 
+        if total > 0 {
+            eprintln!("\n{passed}/{total} expects passed, {failed} failed");
+            if failed > 0 {
+                std::process::exit(1);
+            }
+        } else {
+            eprintln!("\n{} ops executed (no expects)", entries.len());
+        }
+
+        anyhow::Ok(())
+    };
+
+    tokio::try_join!(write_fut, read_fut)?;
     Ok(())
 }
 
